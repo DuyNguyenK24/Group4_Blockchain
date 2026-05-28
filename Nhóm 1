@@ -142,38 +142,42 @@ contract RentalContract {
     
     // Các bước quy trình
     //  Bước 1: Người thuê nạp tiền vào hợp đồng để kích hoạt phiên thuê.
-    function fundRental(uint256 _rentalDays)
-        external
-        payable
-        onlyInitialized
-        onlyRenter
-    {
-        require(_rentalDays > 0, "Rental duration must be at least 1 day");
-        
-        uint256 totalRequired = rentalAmount + depositAmount;
-        require(
-            msg.value == totalRequired,
-            "Payment must equal rentalAmount + depositAmount"
-        );
-        
-        rentalStartTime = block.timestamp;
-        rentalEndTime = block.timestamp + (_rentalDays * 1 days);
-        damageCharges = 0;
-        
-        // Transition state: INITIALIZED → ACTIVE
-        RentalStatus previousStatus = rentalStatus;
-        rentalStatus = RentalStatus.ACTIVE;
-        
-        emit RentalFunded(
-            renter,
-            rentalAmount,
-            depositAmount,
-            rentalEndTime,
-            block.timestamp
-        );
-        emit StatusTransitioned(previousStatus, rentalStatus, block.timestamp);
-    }
+function fundRental(uint256 _rentalDays)
+    external
+    payable
+    onlyInitialized
+    onlyRenter
+{
+    require(_rentalDays > 0, "Rental duration must be at least 1 day");
     
+    // Người thuê vẫn nộp cả 2 khoản
+    uint256 totalRequired = rentalAmount + depositAmount;
+    require(
+        msg.value == totalRequired,
+        "Payment must equal rentalAmount + depositAmount"
+    );
+    
+    rentalStartTime = block.timestamp;
+    rentalEndTime = block.timestamp + (_rentalDays * 1 days);
+    damageCharges = 0;
+    
+    RentalStatus previousStatus = rentalStatus;
+    rentalStatus = RentalStatus.ACTIVE;
+    
+    // Chuyển tiền lập tức cho người cho thuê 
+    (bool rentalPaymentSuccess, ) = payable(owner).call{value: rentalAmount}("");
+    require(rentalPaymentSuccess, "Rental payment to owner failed");
+    
+    emit RentalFunded(
+        renter,
+        rentalAmount,
+        depositAmount,
+        rentalEndTime,
+        block.timestamp
+    );
+    emit StatusTransitioned(previousStatus, rentalStatus, block.timestamp);
+}
+
    // BƯỚC 2: Người thuê bấm nút xác nhận đã hoàn trả lại tài sản.
     function returnItem()
         external
@@ -213,19 +217,21 @@ contract RentalContract {
         onlyReturnedPending
         onlyOwner
     {
-        uint256 ownerPayout = rentalAmount + damageCharges;
+
+        uint256 ownerAdditionalPayout = damageCharges;
         uint256 renterRefund = depositAmount - damageCharges;
         
         // Transition state: RETURNED_PENDING_INSPECTION → COMPLETED
         RentalStatus previousStatus = rentalStatus;
         rentalStatus = RentalStatus.COMPLETED;
         
-        emit RentalConfirmed(owner, ownerPayout, renterRefund, block.timestamp);
+        emit RentalConfirmed(owner, ownerAdditionalPayout, renterRefund, block.timestamp);
         emit StatusTransitioned(previousStatus, rentalStatus, block.timestamp);
         
-        // Transfer to owner
-        (bool ownerSuccess, ) = payable(owner).call{value: ownerPayout}("");
-        require(ownerSuccess, "Payment to owner failed");
+        if (ownerAdditionalPayout > 0) {
+            (bool ownerSuccess, ) = payable(owner).call{value: ownerAdditionalPayout}("");
+            require(ownerSuccess, "Payment to owner failed");
+        }
         
         // Transfer refund to renter
         (bool renterSuccess, ) = payable(renter).call{value: renterRefund}("");
@@ -266,7 +272,7 @@ contract RentalContract {
         onlyDeductionProposed
         onlyRenter
     {
-        uint256 ownerPayout = rentalAmount + damageCharges;
+        uint256 ownerAdditionalPayout = damageCharges;
         uint256 renterRefund = depositAmount - damageCharges;
         
         // Transition state: DEDUCTION_PROPOSED → COMPLETED
@@ -274,12 +280,13 @@ contract RentalContract {
         rentalStatus = RentalStatus.COMPLETED;
         
         emit DeductionAcceptedByRenter(renter, damageCharges, block.timestamp);
-        emit RentalConfirmed(owner, ownerPayout, renterRefund, block.timestamp);
+        emit RentalConfirmed(owner, ownerAdditionalPayout, renterRefund, block.timestamp);
         emit StatusTransitioned(previousStatus, rentalStatus, block.timestamp);
         
-        // Transfer to owner
-        (bool ownerSuccess, ) = payable(owner).call{value: ownerPayout}("");
-        require(ownerSuccess, "Payment to owner failed");
+        if (ownerAdditionalPayout > 0) {
+            (bool ownerSuccess, ) = payable(owner).call{value: ownerAdditionalPayout}("");
+            require(ownerSuccess, "Payment to owner failed");
+        }
         
         // Transfer refund to renter
         (bool renterSuccess, ) = payable(renter).call{value: renterRefund}("");
@@ -302,16 +309,11 @@ contract RentalContract {
             "Inspection/consensus period not yet expired (7 days from return)"
         );
         
-        // FAIR ESCROW DISTRIBUTION LOGIC
-        // Owner always entitled to: rentalAmount + damageCharges (automated fees)
-        // Renter receives: depositAmount - damageCharges (unused collateral)
-        
-        uint256 ownerPayout = rentalAmount + damageCharges;
+        uint256 ownerAdditionalPayout = damageCharges;
         uint256 renterRefund = depositAmount - damageCharges;
         
-        // Sanity check: Total distributed must equal total held
         require(
-            ownerPayout + renterRefund == rentalAmount + depositAmount,
+            ownerAdditionalPayout + renterRefund == depositAmount,
             "Invalid payout calculation"
         );
         
@@ -327,12 +329,13 @@ contract RentalContract {
         RentalStatus previousStatus = rentalStatus;
         rentalStatus = RentalStatus.COMPLETED;
         
-        emit AutoSettled(msg.sender, ownerPayout, renterRefund, reason, block.timestamp);
+        emit AutoSettled(msg.sender, ownerAdditionalPayout, renterRefund, reason, block.timestamp);
         emit StatusTransitioned(previousStatus, rentalStatus, block.timestamp);
         
-        // Transfer to owner (always gets at least rentalAmount)
-        (bool ownerSuccess, ) = payable(owner).call{value: ownerPayout}("");
-        require(ownerSuccess, "Payment to owner failed");
+        if (ownerAdditionalPayout > 0) {
+            (bool ownerSuccess, ) = payable(owner).call{value: ownerAdditionalPayout}("");
+            require(ownerSuccess, "Payment to owner failed");
+        }
         
         // Transfer refund to renter (gets unused deposit collateral)
         (bool renterSuccess, ) = payable(renter).call{value: renterRefund}("");
@@ -427,7 +430,7 @@ contract RentalContract {
         external
         view
         returns (
-            uint256 ownerAmount,
+            uint256 ownerAdditionalAmount,
             uint256 renterAmount
         )
     {
@@ -439,11 +442,10 @@ contract RentalContract {
             return (0, 0);
         }
         
-        // Fair escrow distribution: Owner always gets rentalAmount + damageCharges
-        uint256 ownerPayout = rentalAmount + damageCharges;
+        uint256 ownerAdditional = damageCharges;
         uint256 renterRefund = depositAmount - damageCharges;
         
-        return (ownerPayout, renterRefund);
+        return (ownerAdditional, renterRefund);
     }
     
 // Hàm 7: Bản xem trước cho tính năng Tự động tất toán (Cực kỳ hữu ích cho giao diện đồng hồ đếm ngược trên UI).
@@ -451,7 +453,7 @@ contract RentalContract {
         external
         view
         returns (
-            uint256 ownerPayout,
+            uint256 ownerAdditionalPayout,
             uint256 renterRefund,
             uint256 secondsUntilAutoSettle,
             bool canAutoSettle
@@ -465,8 +467,7 @@ contract RentalContract {
         bool autoSettleReady = block.timestamp >= inspectionDeadline;
         uint256 secondsRemaining = autoSettleReady ? 0 : (inspectionDeadline - block.timestamp);
         
-        // Fair escrow payout
-        uint256 ownerPayoutCalc = rentalAmount + damageCharges;
+        uint256 ownerPayoutCalc = damageCharges;
         uint256 renterRefundCalc = depositAmount - damageCharges;
         
         return (
@@ -477,6 +478,7 @@ contract RentalContract {
         );
     }
 }
+
 
 // Hợp đồng mẹ 
 contract RentalFactory {
