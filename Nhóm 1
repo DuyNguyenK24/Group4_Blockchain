@@ -1,1 +1,556 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract RentalContract {
+// Biến trạng thái 
+    address public immutable owner;                 // Ví của người
+    address public immutable renter;                // Item renter
+    uint256 public immutable rentalAmount;          // Amount renter must pay for rental period
+    uint256 public immutable depositAmount;         // Security deposit (held until completion)
+    uint256 public immutable lateFeePerDay;         // Penalty per day for late return
+    
+    uint256 public rentalStartTime;                 // Timestamp when rental became ACTIVE
+    uint256 public rentalEndTime;                   // Hard deadline for item return
+    uint256 public returnedTime;                    // Timestamp when renter called returnItem()
+    uint256 public damageCharges;                   // Proposed/agreed damage deduction amount
+    
+
+    // Bộ quy trình vận hành 
+    enum RentalStatus {
+        INITIALIZED,
+        ACTIVE,
+        RETURNED_PENDING_INSPECTION,
+        DEDUCTION_PROPOSED,
+        COMPLETED
+    }
+    
+    RentalStatus public rentalStatus;
+    
+    // Hàm sự kiện 
+    event RentalFunded(
+        address indexed renter,
+        uint256 rentalAmount,
+        uint256 depositAmount,
+        uint256 rentalEndTime,
+        uint256 timestamp
+    );
+    
+    event ItemReturned(
+        address indexed renter,
+        uint256 returnedTime,
+        uint256 lateFeesApplied,
+        uint256 timestamp
+    );
+    
+    event DamageDeductionProposed(
+        address indexed owner,
+        uint256 proposedDeduction,
+        uint256 totalDamageCharges,
+        uint256 timestamp
+    );
+    
+    event DeductionAcceptedByRenter(
+        address indexed renter,
+        uint256 agreedDamageCharges,
+        uint256 timestamp
+    );
+    
+    event RentalConfirmed(
+        address indexed owner,
+        uint256 ownerPayout,
+        uint256 renterRefund,
+        uint256 timestamp
+    );
+    
+    event AutoSettled(
+        address indexed settler,
+        uint256 ownerPayout,
+        uint256 renterRefund,
+        string reason,
+        uint256 timestamp
+    );
+    
+    event StatusTransitioned(
+        RentalStatus previousStatus,
+        RentalStatus newStatus,
+        uint256 timestamp
+    );
+    
+    // Hàm khởi tạo hợp đồng
+    constructor(
+        address _renter,
+        uint256 _rentalAmount,
+        uint256 _depositAmount,
+        uint256 _lateFeePerDay
+    ) {
+        require(_renter != address(0), "Invalid renter address");
+        require(_renter != msg.sender, "Renter cannot be owner");
+        require(_rentalAmount > 0, "Rental amount must be positive");
+        require(_depositAmount > 0, "Deposit amount must be positive");
+        require(_lateFeePerDay > 0, "Late fee per day must be positive");
+        
+        owner = msg.sender;
+        renter = _renter;
+        rentalAmount = _rentalAmount;
+        depositAmount = _depositAmount;
+        lateFeePerDay = _lateFeePerDay;
+        rentalStatus = RentalStatus.INITIALIZED;
+    }
+    
+    // Bộ lọc trạng thái 
+    modifier onlyInitialized() {
+        require(
+            rentalStatus == RentalStatus.INITIALIZED,
+            "Contract must be in INITIALIZED status"
+        );
+        _;
+    }
+    
+    modifier onlyActive() {
+        require(
+            rentalStatus == RentalStatus.ACTIVE,
+            "Contract must be in ACTIVE status"
+        );
+        _;
+    }
+    
+    modifier onlyReturnedPending() {
+        require(
+            rentalStatus == RentalStatus.RETURNED_PENDING_INSPECTION,
+            "Contract must be in RETURNED_PENDING_INSPECTION status"
+        );
+        _;
+    }
+    
+    modifier onlyDeductionProposed() {
+        require(
+            rentalStatus == RentalStatus.DEDUCTION_PROPOSED,
+            "Contract must be in DEDUCTION_PROPOSED status"
+        );
+        _;
+    }
+    
+    modifier onlyRenter() {
+        require(msg.sender == renter, "Only renter can call this");
+        _;
+    }
+    
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this");
+        _;
+    }
+    
+    // Các bước quy trình
+    //  Bước 1: Người thuê nạp tiền vào hợp đồng để kích hoạt phiên thuê.
+    function fundRental(uint256 _rentalDays)
+        external
+        payable
+        onlyInitialized
+        onlyRenter
+    {
+        require(_rentalDays > 0, "Rental duration must be at least 1 day");
+        
+        uint256 totalRequired = rentalAmount + depositAmount;
+        require(
+            msg.value == totalRequired,
+            "Payment must equal rentalAmount + depositAmount"
+        );
+        
+        rentalStartTime = block.timestamp;
+        rentalEndTime = block.timestamp + (_rentalDays * 1 days);
+        damageCharges = 0;
+        
+        // Transition state: INITIALIZED → ACTIVE
+        RentalStatus previousStatus = rentalStatus;
+        rentalStatus = RentalStatus.ACTIVE;
+        
+        emit RentalFunded(
+            renter,
+            rentalAmount,
+            depositAmount,
+            rentalEndTime,
+            block.timestamp
+        );
+        emit StatusTransitioned(previousStatus, rentalStatus, block.timestamp);
+    }
+    
+   // BƯỚC 2: Người thuê bấm nút xác nhận đã hoàn trả lại tài sản.
+    function returnItem()
+        external
+        onlyActive
+        onlyRenter
+    {
+        returnedTime = block.timestamp;
+        
+        // Calculate automated late fees if return is overdue
+        uint256 lateFeesApplied = 0;
+        if (block.timestamp > rentalEndTime) {
+            // Gas-efficient rounding-up formula for overdue days
+            uint256 overdueDays = (block.timestamp - rentalEndTime + 1 days - 1) / 1 days;
+            
+            lateFeesApplied = overdueDays * lateFeePerDay;
+            
+            // Cap late fees at deposit amount
+            if (lateFeesApplied > depositAmount) {
+                lateFeesApplied = depositAmount;
+            }
+            
+            damageCharges = lateFeesApplied;
+        }
+        
+        // Transition state: ACTIVE → RETURNED_PENDING_INSPECTION
+        RentalStatus previousStatus = rentalStatus;
+        rentalStatus = RentalStatus.RETURNED_PENDING_INSPECTION;
+        
+        emit ItemReturned(renter, returnedTime, lateFeesApplied, block.timestamp);
+        emit StatusTransitioned(previousStatus, rentalStatus, block.timestamp);
+    }
+    
+// Bước 3:
+// Trường hợp 1: Chủ đồ chấp nhận nhận lại hàng và xác nhận không có hư hại gì     
+    function confirmReceipt()
+        external
+        onlyReturnedPending
+        onlyOwner
+    {
+        uint256 ownerPayout = rentalAmount + damageCharges;
+        uint256 renterRefund = depositAmount - damageCharges;
+        
+        // Transition state: RETURNED_PENDING_INSPECTION → COMPLETED
+        RentalStatus previousStatus = rentalStatus;
+        rentalStatus = RentalStatus.COMPLETED;
+        
+        emit RentalConfirmed(owner, ownerPayout, renterRefund, block.timestamp);
+        emit StatusTransitioned(previousStatus, rentalStatus, block.timestamp);
+        
+        // Transfer to owner
+        (bool ownerSuccess, ) = payable(owner).call{value: ownerPayout}("");
+        require(ownerSuccess, "Payment to owner failed");
+        
+        // Transfer refund to renter
+        (bool renterSuccess, ) = payable(renter).call{value: renterRefund}("");
+        require(renterSuccess, "Refund to renter failed");
+    }
+    
+//  Trường hợp 2: Chủ đồ đề xuất một mức phạt hư hại tài sản bổ sung (ngoài tiền trễ hạn tự động).
+    function proposeDamageDeduction(uint256 _additionalDeduction)
+        external
+        onlyReturnedPending
+        onlyOwner
+    {
+        require(_additionalDeduction > 0, "Deduction must be greater than 0");
+        
+        uint256 totalProposedCharges = damageCharges + _additionalDeduction;
+        require(
+            totalProposedCharges <= depositAmount,
+            "Total deduction cannot exceed deposit amount"
+        );
+        
+        damageCharges = totalProposedCharges;
+        
+        // Transition state: RETURNED_PENDING_INSPECTION → DEDUCTION_PROPOSED
+        RentalStatus previousStatus = rentalStatus;
+        rentalStatus = RentalStatus.DEDUCTION_PROPOSED;
+        
+        emit DamageDeductionProposed(
+            owner,
+            _additionalDeduction,
+            totalProposedCharges,
+            block.timestamp
+        );
+        emit StatusTransitioned(previousStatus, rentalStatus, block.timestamp);
+    }
+    
+    function acceptDeduction()
+        external
+        onlyDeductionProposed
+        onlyRenter
+    {
+        uint256 ownerPayout = rentalAmount + damageCharges;
+        uint256 renterRefund = depositAmount - damageCharges;
+        
+        // Transition state: DEDUCTION_PROPOSED → COMPLETED
+        RentalStatus previousStatus = rentalStatus;
+        rentalStatus = RentalStatus.COMPLETED;
+        
+        emit DeductionAcceptedByRenter(renter, damageCharges, block.timestamp);
+        emit RentalConfirmed(owner, ownerPayout, renterRefund, block.timestamp);
+        emit StatusTransitioned(previousStatus, rentalStatus, block.timestamp);
+        
+        // Transfer to owner
+        (bool ownerSuccess, ) = payable(owner).call{value: ownerPayout}("");
+        require(ownerSuccess, "Payment to owner failed");
+        
+        // Transfer refund to renter
+        (bool renterSuccess, ) = payable(renter).call{value: renterRefund}("");
+        require(renterSuccess, "Refund to renter failed");
+    }
+    
+// Trường hợp 3: Tự động tất toán nếu thời hạn kiểm tra hoặc thời hạn đạt đồng thuận bị quá hạn (7 ngày). 
+    function autoSettle()
+        external
+    {
+        require(
+            rentalStatus == RentalStatus.RETURNED_PENDING_INSPECTION ||
+            rentalStatus == RentalStatus.DEDUCTION_PROPOSED,
+            "Contract must be in RETURNED_PENDING_INSPECTION or DEDUCTION_PROPOSED status"
+        );
+        
+        uint256 inspectionPeriod = 7 days;
+        require(
+            block.timestamp >= returnedTime + inspectionPeriod,
+            "Inspection/consensus period not yet expired (7 days from return)"
+        );
+        
+        // FAIR ESCROW DISTRIBUTION LOGIC
+        // Owner always entitled to: rentalAmount + damageCharges (automated fees)
+        // Renter receives: depositAmount - damageCharges (unused collateral)
+        
+        uint256 ownerPayout = rentalAmount + damageCharges;
+        uint256 renterRefund = depositAmount - damageCharges;
+        
+        // Sanity check: Total distributed must equal total held
+        require(
+            ownerPayout + renterRefund == rentalAmount + depositAmount,
+            "Invalid payout calculation"
+        );
+        
+        // Determine settlement reason for event logging
+        string memory reason;
+        if (rentalStatus == RentalStatus.RETURNED_PENDING_INSPECTION) {
+            reason = "Owner_Did_Not_Respond_Within_7_Days";
+        } else {
+            reason = "Renter_Did_Not_Accept_Damage_Proposal_Within_7_Days";
+        }
+        
+        // Transition state: RETURNED_PENDING_INSPECTION/DEDUCTION_PROPOSED → COMPLETED
+        RentalStatus previousStatus = rentalStatus;
+        rentalStatus = RentalStatus.COMPLETED;
+        
+        emit AutoSettled(msg.sender, ownerPayout, renterRefund, reason, block.timestamp);
+        emit StatusTransitioned(previousStatus, rentalStatus, block.timestamp);
+        
+        // Transfer to owner (always gets at least rentalAmount)
+        (bool ownerSuccess, ) = payable(owner).call{value: ownerPayout}("");
+        require(ownerSuccess, "Payment to owner failed");
+        
+        // Transfer refund to renter (gets unused deposit collateral)
+        (bool renterSuccess, ) = payable(renter).call{value: renterRefund}("");
+        require(renterSuccess, "Refund to renter failed");
+    }
+    
+// Hàm truy vấn dữ liệu 
+// Hàm 1: Đọc trạng thái hợp đồng dạng chữ (String) để người dùng dễ đọc trên giao diện App.
+    function getStatusString() external view returns (string memory) {
+        if (rentalStatus == RentalStatus.INITIALIZED) {
+            return "INITIALIZED";
+        } else if (rentalStatus == RentalStatus.ACTIVE) {
+            return "ACTIVE";
+        } else if (rentalStatus == RentalStatus.RETURNED_PENDING_INSPECTION) {
+            return "RETURNED_PENDING_INSPECTION";
+        } else if (rentalStatus == RentalStatus.DEDUCTION_PROPOSED) {
+            return "DEDUCTION_PROPOSED";
+        } else {
+            return "COMPLETED";
+        }
+    }
+    
+// Hàm 2: Xem số ngày bị trễ hạn hiện tại dựa trên đồng hồ thời gian thực.
+    function calculateOverdueDays() external view returns (uint256) {
+        if (block.timestamp <= rentalEndTime) {
+            return 0;
+        }
+        
+        // Gas-efficient rounding-up formula
+        return (block.timestamp - rentalEndTime + 1 days - 1) / 1 days;
+    }
+    
+// Hàm 3: Tính nhẩm trước số tiền phạt trễ hạn tiềm năng (chưa bị cắt ngọn theo trần tiền cọc).
+    function calculatePotentialLateFee() external view returns (uint256) {
+        if (block.timestamp <= rentalEndTime) {
+            return 0;
+        }
+        
+        // Gas-efficient rounding-up formula for overdue days
+        uint256 overdueDays = (block.timestamp - rentalEndTime + 1 days - 1) / 1 days;
+        
+        return overdueDays * lateFeePerDay;
+    }
+    
+// Hàm 4: Tính số giây còn lại của thời hạn 7 ngày nghiệm thu/thỏa thuận sau khi khách trả đồ.
+    function getRemainingSettlementPeriod() external view returns (int256) {
+        if (returnedTime == 0) {
+            return -1; // Item not yet returned
+        }
+        
+        uint256 inspectionDeadline = returnedTime + 7 days;
+        if (block.timestamp >= inspectionDeadline) {
+            return 0; // Deadline passed
+        }
+        
+        return int256(inspectionDeadline - block.timestamp);
+    }
+    
+// Hàm 5: Xuất toàn bộ thông tin tổng hợp của hợp đồng trong một lần gọi (Dùng để nạp dữ liệu cho trang quản trị/Excel).
+    function getContractSummary()
+        external
+        view
+        returns (
+            address _owner,
+            address _renter,
+            uint256 _rentalAmount,
+            uint256 _depositAmount,
+            uint256 _lateFeePerDay,
+            RentalStatus _status,
+            uint256 _rentalStartTime,
+            uint256 _rentalEndTime,
+            uint256 _returnedTime,
+            uint256 _damageCharges
+        )
+    {
+        return (
+            owner,
+            renter,
+            rentalAmount,
+            depositAmount,
+            lateFeePerDay,
+            rentalStatus,
+            rentalStartTime,
+            rentalEndTime,
+            returnedTime,
+            damageCharges
+        );
+    }
+    
+// Hàm 6: Xem trước số tiền dự kiến nhận được của mỗi bên nếu bấm nút tất toán tại thời điểm này.
+    function getExpectedPayouts()
+        external
+        view
+        returns (
+            uint256 ownerAmount,
+            uint256 renterAmount
+        )
+    {
+        if (
+            rentalStatus != RentalStatus.RETURNED_PENDING_INSPECTION &&
+            rentalStatus != RentalStatus.DEDUCTION_PROPOSED
+        ) {
+            // Contract not yet in settlement phase
+            return (0, 0);
+        }
+        
+        // Fair escrow distribution: Owner always gets rentalAmount + damageCharges
+        uint256 ownerPayout = rentalAmount + damageCharges;
+        uint256 renterRefund = depositAmount - damageCharges;
+        
+        return (ownerPayout, renterRefund);
+    }
+    
+// Hàm 7: Bản xem trước cho tính năng Tự động tất toán (Cực kỳ hữu ích cho giao diện đồng hồ đếm ngược trên UI).
+    function getAutoSettlePreview()
+        external
+        view
+        returns (
+            uint256 ownerPayout,
+            uint256 renterRefund,
+            uint256 secondsUntilAutoSettle,
+            bool canAutoSettle
+        )
+    {
+        if (returnedTime == 0) {
+            return (0, 0, 0, false);
+        }
+        
+        uint256 inspectionDeadline = returnedTime + 7 days;
+        bool autoSettleReady = block.timestamp >= inspectionDeadline;
+        uint256 secondsRemaining = autoSettleReady ? 0 : (inspectionDeadline - block.timestamp);
+        
+        // Fair escrow payout
+        uint256 ownerPayoutCalc = rentalAmount + damageCharges;
+        uint256 renterRefundCalc = depositAmount - damageCharges;
+        
+        return (
+            ownerPayoutCalc,
+            renterRefundCalc,
+            secondsRemaining,
+            autoSettleReady
+        );
+    }
+}
+
+// Hợp đồng mẹ 
+contract RentalFactory {
+    RentalContract[] public rentalContracts;
+    mapping(address => RentalContract[]) public ownerRentals;
+    mapping(address => RentalContract[]) public renterRentals; // Theo dõi góc độ Khách thuê
+    mapping(address => bool) public isValidRental;
+    
+    event RentalContractCreated(
+        address indexed rentalAddress,
+        address indexed itemOwner,
+        address indexed itemRenter,
+        uint256 rentalAmount,
+        uint256 depositAmount
+    );
+    
+    function createRentalContract(
+        address _renter,
+        uint256 _rentalAmount,
+        uint256 _depositAmount,
+        uint256 _lateFeePerDay
+    ) public returns (address) {
+        require(_renter != address(0), "Invalid renter address");
+        require(_renter != msg.sender, "Owner cannot rent to themselves");
+        require(_rentalAmount > 0, "Rental amount must be positive");
+        require(_depositAmount > 0, "Deposit amount must be positive");
+        require(_lateFeePerDay > 0, "Late fee must be positive");
+        
+        RentalContract newRental = new RentalContract(
+            _renter,
+            _rentalAmount,
+            _depositAmount,
+            _lateFeePerDay
+        );
+        
+        rentalContracts.push(newRental);
+        ownerRentals[msg.sender].push(newRental);
+        renterRentals[_renter].push(newRental);
+        isValidRental[address(newRental)] = true;
+        
+        emit RentalContractCreated(
+            address(newRental),
+            msg.sender,
+            _renter,
+            _rentalAmount,
+            _depositAmount
+        );
+        
+        return address(newRental);
+    }
+    
+    function getTotalRentalContracts() public view returns (uint256) {
+        return rentalContracts.length;
+    }
+    
+    function getRentalContract(uint256 _index) public view returns (address) {
+        require(_index < rentalContracts.length, "Index out of bounds");
+        return address(rentalContracts[_index]);
+    }
+    
+    function getOwnerRentals(address _owner) public view returns (RentalContract[] memory) {
+        return ownerRentals[_owner];
+    }
+    
+    function getOwnerRentalCount(address _owner) public view returns (uint256) {
+        return ownerRentals[_owner].length;
+    }
+
+    function getRenterRentals(address _renter) public view returns (RentalContract[] memory) {
+        return renterRentals[_renter];
+    }
+    
+    function getAllRentalContracts() public view returns (RentalContract[] memory) {
+        return rentalContracts;
+    }
+}
 
