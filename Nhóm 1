@@ -3,7 +3,7 @@ pragma solidity ^0.8.0;
 
 contract RentalContract {
 // Biến trạng thái 
-    address public immutable owner;                 // Ví của người
+    address public immutable owner;                 // Ví của người cho thuê
     address public immutable renter;                // Item renter
     uint256 public immutable rentalAmount;          // Amount renter must pay for rental period
     uint256 public immutable depositAmount;         // Security deposit (held until completion)
